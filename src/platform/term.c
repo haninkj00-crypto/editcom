@@ -1,4 +1,7 @@
 #include "edit.h"
+#ifndef _WIN32
+  #include <sys/ioctl.h>
+#endif
 
 /* 표준 VGA 16색 DAC RGB (CGA Blue 1 = #0000AA) */
 static const uint8_t VGA_RGB[16][3] = {
@@ -110,29 +113,26 @@ static HANDLE g_hIn, g_hOut;
 static DWORD  g_orig_in_mode, g_orig_out_mode;
 
 void term_init(void) {
-    tcgetattr(STDIN_FILENO, &g_orig_termios);
-    struct termios raw = g_orig_termios;
-    raw.c_iflag &= (tcflag_t)~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= (tcflag_t)~(OPOST);
-    raw.c_cflag |= (CS8);
-    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN | ISIG);
-    raw.c_cc[VMIN]  = 1;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    g_hIn  = GetStdHandle(STD_INPUT_HANDLE);
+    g_hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    GetConsoleMode(g_hIn, &g_orig_in_mode);
+    GetConsoleMode(g_hOut, &g_orig_out_mode);
+    SetConsoleMode(g_hIn, ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS);
 
-    /* 대체 화면 버퍼 진입(?1049h) + 자동 줄바꿈/스크롤 차단(?7l) + 80x25 요청 */
-    const char *init_seq = "\x1b[?1049h\x1b[?7l\x1b[8;25;80t\x1b[0m\x1b[2J\x1b[H";
-    ssize_t u = write(STDOUT_FILENO, init_seq, strlen(init_seq));
-    (void)u;
+    /* 항상 80x25로 초기화 (버퍼와 창 크기를 일치시켜 스크롤백 제거) */
+    SMALL_RECT tiny = { 0, 0, 1, 1 };
+    SetConsoleWindowInfo(g_hOut, TRUE, &tiny);
+    COORD sz = { SCREEN_INIT_COLS, SCREEN_INIT_ROWS };
+    SetConsoleScreenBufferSize(g_hOut, sz);
+    SMALL_RECT rc = { 0, 0, SCREEN_INIT_COLS - 1, SCREEN_INIT_ROWS - 1 };
+    SetConsoleWindowInfo(g_hOut, TRUE, &rc);
     scr_init(SCREEN_INIT_COLS, SCREEN_INIT_ROWS);
 }
 
 void term_cleanup(void) {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
-    /* 자동 줄바꿈 복원(?7h) + 대체 화면 버퍼 종료(?1049l) */
-    const char *rst = "\x1b[0m\x1b[?25h\x1b[?7h\x1b[?1049l";
-    ssize_t u = write(STDOUT_FILENO, rst, strlen(rst));
-    (void)u;
+    SetConsoleMode(g_hIn, g_orig_in_mode);
+    SetConsoleMode(g_hOut, g_orig_out_mode);
+    SetConsoleTextAttribute(g_hOut, 7);
 }
 
 void term_flush(int cur_x, int cur_y, bool show_cursor) {
@@ -141,7 +141,6 @@ void term_flush(int cur_x, int cur_y, bool show_cursor) {
     if (!ci) return;
     for (int i = 0; i < cols * rows; ++i) {
         ScreenCell *sc = &g_scr.cells[i];
-        if (y == g_scr.rows - 1 && x == g_scr.cols - 1) { *pv = *sc; continue; } /* 우측 하단 끝 셀 스크롤 방지 가드 */
         ci[i].Attributes = (WORD)((sc->bg << 4) | (sc->fg & 0x0F));
         if (sc->kind == CELL_TRAIL) {
             ci[i].Char.UnicodeChar = L' ';
@@ -234,8 +233,12 @@ void term_init(void) {
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 
-    /* 항상 80x25로 초기화 (xterm 호환 리사이즈 요청 + 화면 클리어) */
-    const char *init_seq = "\x1b[8;25;80t\x1b[0m\x1b[2J\x1b[H";
+    /* 대체 화면 진입(?1049h) + 자동 줄바꿈 해제(?7l) + 80x25 요청 */
+    const char *init_seq =
+        "\x1b[?1049h"
+        "\x1b[?7l"
+        "\x1b[8;25;80t"
+        "\x1b[0m\x1b[2J\x1b[H";
     ssize_t u = write(STDOUT_FILENO, init_seq, strlen(init_seq));
     (void)u;
     scr_init(SCREEN_INIT_COLS, SCREEN_INIT_ROWS);
@@ -243,23 +246,33 @@ void term_init(void) {
 
 void term_cleanup(void) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
-    const char *rst = "\x1b[0m\x1b[?25h\x1b[2J\x1b[H";
+    /* 자동 줄바꿈 복원(?7h) + 기본 화면 복귀(?1049l) */
+    const char *rst = "\x1b[0m\x1b[?25h\x1b[?7h\x1b[?1049l";
     ssize_t u = write(STDOUT_FILENO, rst, strlen(rst));
     (void)u;
 }
 
 void term_flush(int cur_x, int cur_y, bool show_cursor) {
+    struct winsize ws;
+    int max_r = g_scr.rows, max_c = g_scr.cols;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+        if (ws.ws_row < max_r) max_r = ws.ws_row;
+        if (ws.ws_col < max_c) max_c = ws.ws_col;
+    }
+
     char out[65536];
     size_t pos = 0;
     uint8_t last_fg = 0xFF, last_bg = 0xFF;
 
     pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "\x1b[?25l");
-    for (int y = 0; y < g_scr.rows; ++y) {
+    for (int y = 0; y < max_r; ++y) {
         bool moved = false;
-        for (int x = 0; x < g_scr.cols; ++x) {
+        for (int x = 0; x < max_c; ++x) {
             int idx = y * g_scr.cols + x;
             ScreenCell *sc = &g_scr.cells[idx];
             ScreenCell *pv = &g_scr.prev[idx];
+            /* 우측 하단 끝 셀 출력 시 터미널 강제 스크롤 방지 */
+            if (y == max_r - 1 && x == max_c - 1) { *pv = *sc; moved = false; continue; }
             if (sc->kind == CELL_TRAIL) { *pv = *sc; moved = false; continue; }
             if (memcmp(sc, pv, sizeof(ScreenCell)) == 0) { moved = false; continue; }
             if (pos > sizeof(out) - 160) {
@@ -287,6 +300,8 @@ void term_flush(int cur_x, int cur_y, bool show_cursor) {
         }
     }
     if (show_cursor) {
+        if (cur_x >= max_c) cur_x = max_c - 1;
+        if (cur_y >= max_r) cur_y = max_r - 1;
         pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "\x1b[%d;%dH\x1b[?25h", cur_y + 1, cur_x + 1);
     }
     ssize_t w = write(STDOUT_FILENO, out, pos);
